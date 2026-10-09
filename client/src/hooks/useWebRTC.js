@@ -82,12 +82,15 @@ export function useWebRTC() {
   const getOutgoingAudioTrack = () => mixedAudioTrackRef.current || getMicTrack();
   const getOutgoingVideoTrack = () => screenVideoTrackRef.current || getCameraTrack();
 
-  // Swap the track that is sent to every peer. The transceivers always exist, so no renegotiation is needed.
   const replaceOutgoing = useCallback(async (kind, track) => {
     for (const [id, meta] of peers.current.entries()) {
       const transceiver = kind === 'audio' ? meta.audioTransceiver : meta.videoTransceiver;
+      const currentTrack = transceiver.sender.track;
       try {
         await transceiver.sender.replaceTrack(track);
+        if (currentTrack && currentTrack !== track && currentTrack.readyState === 'live') {
+          currentTrack.stop();
+        }
       } catch (err) {
         console.warn(`[WebRTC] replaceTrack(${kind}) failed for ${id}:`, err);
       }
@@ -598,7 +601,7 @@ export function useWebRTC() {
       } catch {
         // not supported
       }
-      videoTrack.onended = () => stopScreenShareRef.current?.(); // browser's own "Stop sharing" bar
+      videoTrack.onended = () => stopScreenShareRef.current?.();
 
       setScreenStream(stream);
       setSharedVideoElement(mediaElement);
