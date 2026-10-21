@@ -4,11 +4,8 @@ import { useLanguage } from '../i18n/LanguageContext';
 
 // ---------------------------------------------------------------------------
 // ICE configuration
-// STUN alone is not enough for people behind strict corporate / mobile NATs.
-// To make video, screen sharing and presentations reach everybody, add a TURN
-// server in client/.env (see client/.env.example):
-//   VITE_TURN_URL=turn:turn.example.com:3478,turns:turn.example.com:5349
-//   VITE_TURN_USERNAME=...   VITE_TURN_CREDENTIAL=...
+// Includes public STUN + free OpenRelay TURN servers so video & screen sharing
+// work reliably even across different networks, firewalls, and mobile NATs.
 // ---------------------------------------------------------------------------
 function buildRtcConfig() {
   const iceServers = [
@@ -16,6 +13,15 @@ function buildRtcConfig() {
     { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:stun.cloudflare.com:3478' },
     { urls: 'stun:global.stun.twilio.com:3478' },
+    {
+      urls: [
+        'turn:openrelay.metered.ca:80',
+        'turn:openrelay.metered.ca:443',
+        'turn:openrelay.metered.ca:443?transport=tcp',
+      ],
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    },
   ];
 
   const turnUrl = import.meta.env.VITE_TURN_URL;
@@ -72,7 +78,7 @@ export function useWebRTC() {
   const vadRef = useRef({ ctx: null, raf: 0, stopped: true });
   const mediaRecorderRef = useRef(null);
   const recordedChunksRef = useRef([]);
-  const initGenRef = useRef(0); // lets us ignore a getUserMedia that finishes after we already left
+  const initGenRef = useRef(0);
 
   // -------------------------------------------------------------------------
   // Outgoing track helpers
@@ -82,20 +88,45 @@ export function useWebRTC() {
   const getOutgoingAudioTrack = () => mixedAudioTrackRef.current || getMicTrack();
   const getOutgoingVideoTrack = () => screenVideoTrackRef.current || getCameraTrack();
 
-  const replaceOutgoing = useCallback(async (kind, track) => {
-    for (const [id, meta] of peers.current.entries()) {
-      const transceiver = kind === 'audio' ? meta.audioTransceiver : meta.videoTransceiver;
-      const currentTrack = transceiver.sender.track;
-      try {
-        await transceiver.sender.replaceTrack(track);
-        if (currentTrack && currentTrack !== track && currentTrack.readyState === 'live') {
-          currentTrack.stop();
-        }
-      } catch (err) {
-        console.warn(`[WebRTC] replaceTrack(${kind}) failed for ${id}:`, err);
-      }
+  const sendOffer = useCallback(async (targetSocketId, options) => {
+    const meta = peers.current.get(targetSocketId);
+    if (!meta) return;
+    const { pc } = meta;
+
+    try {
+      meta.makingOffer = true;
+      const offer = await pc.createOffer(options);
+      if (pc.signalingState !== 'stable') return;
+      await pc.setLocalDescription(offer);
+      socket.emit('signal-offer', { targetSocketId, offer: pc.localDescription });
+    } catch (err) {
+      console.error('[WebRTC] Error creating offer:', err);
+    } finally {
+      meta.makingOffer = false;
     }
   }, []);
+
+  // Swap the track that is sent to every peer and renegotiate when needed so remote peers
+  // immediately wake up their video decoder (critical when camera was off before screen sharing).
+  const replaceOutgoing = useCallback(
+    async (kind, track, renegotiate = false) => {
+      for (const [id, meta] of peers.current.entries()) {
+        const transceiver = kind === 'audio' ? meta.audioTransceiver : meta.videoTransceiver;
+        if (!transceiver) continue;
+        try {
+          if (track) track.enabled = true;
+          transceiver.direction = 'sendrecv';
+          await transceiver.sender.replaceTrack(track || null);
+          if (renegotiate && meta.pc.signalingState === 'stable') {
+            await sendOffer(id);
+          }
+        } catch (err) {
+          console.warn(`[WebRTC] replaceTrack(${kind}) failed for ${id}:`, err);
+        }
+      }
+    },
+    [sendOffer]
+  );
 
   // -------------------------------------------------------------------------
   // Voice activity detection (speaking indicator)
@@ -177,7 +208,6 @@ export function useWebRTC() {
         stream = await tryGetUserMedia({ audio: AUDIO_CONSTRAINTS, video: VIDEO_CONSTRAINTS });
 
         if (!stream) {
-          // Camera or microphone is missing/denied: keep whatever is available (e.g. a PC without a webcam)
           const audioOnly = await tryGetUserMedia({ audio: AUDIO_CONSTRAINTS });
           const videoOnly = await tryGetUserMedia({ video: VIDEO_CONSTRAINTS });
           stream = new MediaStream([...(audioOnly?.getTracks() || []), ...(videoOnly?.getTracks() || [])]);
@@ -188,7 +218,6 @@ export function useWebRTC() {
       }
 
       if (generation !== initGenRef.current) {
-        // A newer init (or leaving the room) happened while we waited for the permission prompt
         stream.getTracks().forEach((track) => track.stop());
         return stream;
       }
@@ -214,7 +243,6 @@ export function useWebRTC() {
     [setupVoiceActivity]
   );
 
-  // What the server should be told when joining (real device state, not only the lobby choice)
   const getMediaState = useCallback(() => {
     const mic = getMicTrack();
     const cam = getCameraTrack();
@@ -230,13 +258,12 @@ export function useWebRTC() {
 
     const track = stream.getAudioTracks()[0];
     if (!track) {
-      // Microphone was not available at start: ask again
       try {
         const micStream = await navigator.mediaDevices.getUserMedia({ audio: AUDIO_CONSTRAINTS });
         const newTrack = micStream.getAudioTracks()[0];
         stream.addTrack(newTrack);
         setupVoiceActivity(stream);
-        if (!mixedAudioTrackRef.current) await replaceOutgoing('audio', newTrack);
+        if (!mixedAudioTrackRef.current) await replaceOutgoing('audio', newTrack, true);
         setIsAudioMuted(false);
         socket.emit('toggle-media', { mediaType: 'audio', enabled: true });
       } catch (err) {
@@ -257,12 +284,11 @@ export function useWebRTC() {
 
     const track = stream.getVideoTracks()[0];
     if (!track) {
-      // Camera was not available at start: ask again
       try {
         const camStream = await navigator.mediaDevices.getUserMedia({ video: VIDEO_CONSTRAINTS });
         const newTrack = camStream.getVideoTracks()[0];
         stream.addTrack(newTrack);
-        if (!screenVideoTrackRef.current) await replaceOutgoing('video', newTrack);
+        if (!screenVideoTrackRef.current) await replaceOutgoing('video', newTrack, true);
         setIsVideoOff(false);
         socket.emit('toggle-media', { mediaType: 'video', enabled: true });
       } catch (err) {
@@ -303,25 +329,6 @@ export function useWebRTC() {
     });
   }, []);
 
-  const sendOffer = useCallback(async (targetSocketId, options) => {
-    const meta = peers.current.get(targetSocketId);
-    if (!meta) return;
-    const { pc } = meta;
-
-    try {
-      meta.makingOffer = true;
-      const offer = await pc.createOffer(options);
-      if (pc.signalingState !== 'stable') return;
-      await pc.setLocalDescription(offer);
-      socket.emit('signal-offer', { targetSocketId, offer: pc.localDescription });
-    } catch (err) {
-      console.error('[WebRTC] Error creating offer:', err);
-    } finally {
-      meta.makingOffer = false;
-    }
-  }, []);
-
-  // Connection dropped (network change, sleep, NAT timeout): restart ICE instead of giving up
   const restartPeer = useCallback(
     (targetSocketId) => {
       const meta = peers.current.get(targetSocketId);
@@ -360,9 +367,7 @@ export function useWebRTC() {
       };
       peers.current.set(targetSocketId, meta);
 
-      // One audio and one video transceiver per peer, ALWAYS - even when the user has no camera/microphone.
-      // This guarantees every side can receive audio/video and that screen sharing is just a replaceTrack().
-      const streams = localStreamRef.current ? [localStreamRef.current] : [];
+      const streams = localStreamRef.current ? [localStreamRef.current] : [new MediaStream()];
       meta.audioTransceiver = pc.addTransceiver(getOutgoingAudioTrack() || 'audio', { direction: 'sendrecv', streams });
       meta.videoTransceiver = pc.addTransceiver(getOutgoingVideoTrack() || 'video', { direction: 'sendrecv', streams });
 
@@ -375,14 +380,18 @@ export function useWebRTC() {
       pc.ontrack = (event) => {
         console.log(`[WebRTC] Received ${event.track.kind} track from ${targetSocketId}`);
         const track = event.track;
-        setRemoteStreams((prev) => {
-          if (peers.current.get(targetSocketId)?.pc !== pc) return prev; // stale connection
-          const current = prev.get(targetSocketId);
-          const otherTracks = current ? current.getTracks().filter((tr) => tr.kind !== track.kind) : [];
-          const updated = new Map(prev);
-          updated.set(targetSocketId, new MediaStream([...otherTracks, track]));
-          return updated;
-        });
+        const refreshStream = () => {
+          setRemoteStreams((prev) => {
+            if (peers.current.get(targetSocketId)?.pc !== pc) return prev;
+            const current = prev.get(targetSocketId);
+            const otherTracks = current ? current.getTracks().filter((tr) => tr.kind !== track.kind) : [];
+            const updated = new Map(prev);
+            updated.set(targetSocketId, new MediaStream([...otherTracks, track]));
+            return updated;
+          });
+        };
+        track.onunmute = refreshStream;
+        refreshStream();
       };
 
       pc.onconnectionstatechange = () => {
@@ -411,7 +420,6 @@ export function useWebRTC() {
     [cleanupPeer, restartPeer, sendOffer]
   );
 
-  // Close every connection (used when our own socket reconnected and got a new id)
   const resetPeers = useCallback(() => {
     Array.from(peers.current.keys()).forEach((id) => cleanupPeer(id));
     pendingCandidates.current.clear();
@@ -420,7 +428,6 @@ export function useWebRTC() {
 
   // Signaling listeners
   useEffect(() => {
-    // Existing users do NOT initiate - the new user sends the offers
     const handleUserJoined = ({ participant }) => {
       console.log(`[WebRTC] Existing user noticed new user: ${participant.name} (${participant.socketId})`);
       createPeerConnection(participant.socketId, false);
@@ -446,7 +453,7 @@ export function useWebRTC() {
       try {
         const collision = meta.makingOffer || pc.signalingState !== 'stable';
         if (collision) {
-          if (meta.isInitiator) return; // the initiator is "impolite": ignore the colliding offer
+          if (meta.isInitiator) return;
           if (pc.signalingState === 'have-local-offer') {
             await pc.setLocalDescription({ type: 'rollback' });
           }
@@ -494,14 +501,13 @@ export function useWebRTC() {
 
     const handleRequestRenegotiation = ({ senderSocketId }) => {
       const meta = peers.current.get(senderSocketId);
-      if (meta?.isInitiator) sendOffer(senderSocketId, { iceRestart: true });
+      if (meta) sendOffer(senderSocketId, { iceRestart: true });
     };
 
     const handleUserLeft = ({ socketId }) => {
       cleanupPeer(socketId);
     };
 
-    // Server refused our screen share because somebody else is already sharing
     const handleScreenShareDenied = ({ sharerName }) => {
       alert(tRef.current.screenShareBusy(sharerName || '...'));
       stopScreenShareRef.current?.();
@@ -526,7 +532,6 @@ export function useWebRTC() {
     };
   }, [createPeerConnection, cleanupPeer, sendOffer]);
 
-  // The NEW user initiates connections to everybody who is already in the room
   const connectToExistingParticipants = useCallback(
     (participants) => {
       console.log(`[WebRTC] New user connecting to ${participants.length} existing participants`);
@@ -540,7 +545,6 @@ export function useWebRTC() {
   // -------------------------------------------------------------------------
   // Screen / video-file sharing
   // -------------------------------------------------------------------------
-  // Mix the microphone with the shared audio into ONE track (a connection has a single audio sender)
   const buildAudioMix = (connectExtraSource) => {
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
     const ctx = new AudioContextClass();
@@ -575,18 +579,21 @@ export function useWebRTC() {
     setSharedVideoElement(null);
     setIsScreenSharing(false);
 
-    // Back to camera + microphone for everybody
-    await replaceOutgoing('video', getCameraTrack());
-    await replaceOutgoing('audio', getMicTrack());
+    const camTrack = getCameraTrack();
+    if (camTrack) camTrack.enabled = !isVideoOff;
+
+    await replaceOutgoing('video', camTrack, true);
+    await replaceOutgoing('audio', getMicTrack(), false);
 
     socket.emit('toggle-media', { mediaType: 'screen', enabled: false });
-  }, [replaceOutgoing]);
+  }, [replaceOutgoing, isVideoOff]);
 
   stopScreenShareRef.current = stopScreenShare;
 
   const beginShare = useCallback(
     async ({ stream, mixed = null, mediaElement = null, cleanup = null, contentHint = 'detail' }) => {
       const videoTrack = stream.getVideoTracks()[0];
+      videoTrack.enabled = true;
 
       screenStreamRef.current = stream;
       screenVideoTrackRef.current = videoTrack;
@@ -607,22 +614,20 @@ export function useWebRTC() {
       setSharedVideoElement(mediaElement);
       setIsScreenSharing(true);
 
-      await replaceOutgoing('video', videoTrack);
-      if (mixed) await replaceOutgoing('audio', mixed.track);
+      await replaceOutgoing('video', videoTrack, true);
+      if (mixed) await replaceOutgoing('audio', mixed.track, false);
 
       socket.emit('toggle-media', { mediaType: 'screen', enabled: true });
     },
     [replaceOutgoing]
   );
 
-  // Returns true when sharing actually started
   const startScreenShare = useCallback(async () => {
     if (!navigator.mediaDevices?.getDisplayMedia) {
       alert(tRef.current.screenShareUnsupported);
       return false;
     }
 
-    // Switching from a video file (or an old share) to a new screen share
     if (screenStreamRef.current) await stopScreenShareRef.current();
 
     let stream = null;
@@ -632,9 +637,8 @@ export function useWebRTC() {
         audio: true,
       });
     } catch (err) {
-      if (err.name === 'NotAllowedError' || err.name === 'AbortError') return false; // user cancelled
+      if (err.name === 'NotAllowedError' || err.name === 'AbortError') return false;
       try {
-        // Some browsers reject the "audio" or size constraints
         stream = await navigator.mediaDevices.getDisplayMedia({ video: true });
       } catch (err2) {
         if (err2.name !== 'NotAllowedError' && err2.name !== 'AbortError') {
@@ -666,7 +670,6 @@ export function useWebRTC() {
     return true;
   }, [beginShare]);
 
-  // Stream a local video file (MP4, WebM, MKV...) directly into WebRTC - the sound is sent as well
   const startVideoFileShare = useCallback(
     async (file) => {
       const proto = typeof HTMLMediaElement !== 'undefined' ? HTMLMediaElement.prototype : null;
@@ -698,7 +701,6 @@ export function useWebRTC() {
 
       let mixed = null;
       try {
-        // Route the file's sound ONLY into the outgoing mix: nothing plays locally, so there is no echo
         mixed = buildAudioMix((ctx, dest) => {
           ctx.createMediaElementSource(video).connect(dest);
         });
@@ -728,7 +730,6 @@ export function useWebRTC() {
     [beginShare]
   );
 
-  // After our socket reconnected the server forgot that we are sharing: tell it again
   const reannounceSharing = useCallback(() => {
     if (screenStreamRef.current) {
       socket.emit('toggle-media', { mediaType: 'screen', enabled: true });
@@ -736,7 +737,7 @@ export function useWebRTC() {
   }, []);
 
   // -------------------------------------------------------------------------
-  // Recording (what we send: camera or shared screen + microphone)
+  // Recording
   // -------------------------------------------------------------------------
   const toggleRecording = useCallback(() => {
     if (isRecording) {

@@ -431,7 +431,15 @@ io.on('connection', (socket) => {
 
       if (mediaType === 'audio') participant.audioEnabled = enabled;
       if (mediaType === 'video') participant.videoEnabled = enabled;
-      if (mediaType === 'screen') participant.isScreenSharing = enabled;
+      if (mediaType === 'screen') {
+        participant.isScreenSharing = enabled;
+        if (enabled && room.presentation && room.presentation.presenterSocketId === socket.id) {
+          room.presentation = null;
+          room.drawings = {};
+          clearRoomMedia(room);
+          io.to(currentRoomId).emit('presentation-stopped');
+        }
+      }
 
       // Track camera and mic duration
       const attendeeKey = socket.attendeeKey;

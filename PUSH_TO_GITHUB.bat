@@ -17,7 +17,7 @@ if errorlevel 1 (
 )
 
 echo 1. Git статус текширилмоқда...
-cd /d "D:\Программы\videoconf-platform"
+cd /d "%~dp0"
 
 git branch -M main
 

@@ -77,21 +77,32 @@ export function ScreenShareView({
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [needsSoundTap, setNeedsSoundTap] = useState(false);
 
-  // Attach the stream once per stream change (not on every render)
+  // Attach the stream and re-trigger playback whenever a video track unmutes or is added
   useEffect(() => {
     const el = videoRef.current;
     if (!el || !stream) return;
 
-    if (el.srcObject !== stream) el.srcObject = stream;
+    const attachAndPlay = () => {
+      if (el.srcObject !== stream) el.srcObject = stream;
+      el.play().catch(() => {
+        if (!isSelf) {
+          el.muted = true;
+          el.play().catch(() => {});
+          setNeedsSoundTap(true);
+        }
+      });
+    };
 
-    el.play().catch(() => {
-      // Autoplay with sound was blocked: start muted and offer a "turn sound on" button
-      if (!isSelf) {
-        el.muted = true;
-        el.play().catch(() => {});
-        setNeedsSoundTap(true);
-      }
-    });
+    attachAndPlay();
+
+    const vTracks = stream.getVideoTracks();
+    vTracks.forEach((tr) => tr.addEventListener('unmute', attachAndPlay));
+    stream.addEventListener('addtrack', attachAndPlay);
+
+    return () => {
+      vTracks.forEach((tr) => tr.removeEventListener('unmute', attachAndPlay));
+      stream.removeEventListener('addtrack', attachAndPlay);
+    };
   }, [stream, isSelf]);
 
   useEffect(() => {
